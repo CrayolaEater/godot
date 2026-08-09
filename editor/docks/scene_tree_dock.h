@@ -253,7 +253,7 @@ class SceneTreeDock : public EditorDock {
 	void _set_node_owner_recursive(Node *p_node, Node *p_owner, const HashMap<const Node *, Node *> &p_inverse_duplimap);
 
 	bool _validate_no_foreign_selected(const List<Node *> &p_selected);
-	bool _validate_no_instance_selected(const List<Node *> &p_selected);
+	StringName _get_scene_root_type_constraint(Node *p_node) const;
 	void _selection_changed();
 	void _update_script_button();
 	void _queue_update_script_button();

@@ -162,7 +162,13 @@ public:
 	Error copy_from(const Ref<SceneState> &p_scene_state);
 
 	bool can_instantiate() const;
-	Node *instantiate(GenEditState p_edit_state) const;
+	// `p_root_type_override` replaces the class the root node is created with. It must name a
+	// subclass of the root's own type; anything else is ignored with a warning. Used by scenes
+	// that inherit from, or instantiate, this one and retype their root to a subclass.
+	Node *instantiate(GenEditState p_edit_state, const StringName &p_root_type_override = StringName()) const;
+
+	// Class the root node would be created with, following scene inheritance until a type is found.
+	StringName get_root_type() const;
 
 	Array setup_resources_in_array(Array &array_to_scan, const SceneState::NodeData &n, HashMap<Node *, HashMap<Ref<Resource>, Ref<Resource>>> &p_resources_local_to_scenes, Node *node, const StringName sname, int i, Node **ret_nodes, SceneState::GenEditState p_edit_state) const;
 	Dictionary setup_resources_in_dictionary(Dictionary &p_dictionary_to_scan, const SceneState::NodeData &p_n, HashMap<Node *, HashMap<Ref<Resource>, Ref<Resource>>> &p_resources_local_to_scenes, Node *p_node, const StringName p_sname, int p_i, Node **p_ret_nodes, SceneState::GenEditState p_edit_state) const;
@@ -273,6 +279,11 @@ public:
 
 	bool can_instantiate() const;
 	Node *instantiate(GenEditState p_edit_state = GEN_EDIT_STATE_DISABLED) const;
+	// Not exposed to scripting: `instantiate()` keeps its bound signature.
+	Node *instantiate_with_root_type(GenEditState p_edit_state, const StringName &p_root_type_override) const;
+
+	// Class the root node would be created with, following scene inheritance until a type is found.
+	StringName get_root_type() const;
 
 	void recreate_state();
 	void replace_state(Ref<SceneState> p_by);

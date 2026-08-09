@@ -664,6 +664,8 @@ void SceneTreeDock::_tool_selected(int p_tool, bool p_confirm_override) {
 				}
 			}
 
+			// The dialog is shared with TOOL_CHANGE_TYPE, which narrows the base type.
+			create_dialog->set_base_type("Node");
 			create_dialog->popup_create(true);
 		} break;
 		case TOOL_INSTANTIATE: {
@@ -796,8 +798,12 @@ void SceneTreeDock::_tool_selected(int p_tool, bool p_confirm_override) {
 				break;
 			}
 
-			if (!_validate_no_instance_selected(full_selection)) {
-				break;
+			for (Node *E : full_selection) {
+				if (E->get_scene_instance_load_placeholder()) {
+					accept->set_text(TTR("This operation can't be done on placeholder instances."));
+					accept->popup_centered();
+					return;
+				}
 			}
 
 			Node *selected = scene_tree->get_selected();
@@ -807,6 +813,17 @@ void SceneTreeDock::_tool_selected(int p_tool, bool p_confirm_override) {
 			}
 
 			if (selected) {
+				// The root of an inherited or instantiated scene can only be retyped within that
+				// scene's root class, since the rest of the scene is built on top of it.
+				const StringName base_type = _get_scene_root_type_constraint(selected);
+
+				if (base_type != StringName() && full_selection.size() > 1) {
+					accept->set_text(TTR("Nodes that inherit or instantiate a scene must have their type changed one at a time."));
+					accept->popup_centered();
+					break;
+				}
+
+				create_dialog->set_base_type(base_type == StringName() ? String("Node") : String(base_type));
 				create_dialog->popup_create(false, true, selected->get_class(), selected->get_name());
 			}
 		} break;
@@ -2423,8 +2440,8 @@ bool SceneTreeDock::_validate_no_foreign_selected(const List<Node *> &p_selected
 		if (edited_scene->get_scene_inherited_state().is_valid()) {
 			// When edited_scene inherits from another one the root Node will be the parent Scene,
 			// we don't want to consider that Node a foreign one otherwise we would not be able to
-			// delete it.
-			if (edited_scene == E && current_option != TOOL_CHANGE_TYPE) {
+			// delete it, or to retype it to a subclass of the base scene's root type.
+			if (edited_scene == E) {
 				continue;
 			}
 
@@ -2439,16 +2456,22 @@ bool SceneTreeDock::_validate_no_foreign_selected(const List<Node *> &p_selected
 	return true;
 }
 
-bool SceneTreeDock::_validate_no_instance_selected(const List<Node *> &p_selected) {
-	for (Node *E : p_selected) {
-		if (E != edited_scene && E->is_instance()) {
-			accept->set_text(TTR("This operation can't be done on instantiated scenes."));
-			accept->popup_centered();
-			return false;
+StringName SceneTreeDock::_get_scene_root_type_constraint(Node *p_node) const {
+	// Retyping the root of a scene that is inherited or instantiated is limited to subclasses of
+	// that scene's root type, so everything the scene state applies on top of it stays valid.
+	// Returns an empty StringName for nodes that are not such a root, meaning "unconstrained".
+	if (p_node == edited_scene && edited_scene->get_scene_inherited_state().is_valid()) {
+		return edited_scene->get_scene_inherited_state()->get_root_type();
+	}
+
+	if (p_node != edited_scene && p_node->is_instance() && !p_node->get_scene_instance_load_placeholder()) {
+		const Ref<SceneState> instance_state = p_node->get_scene_instance_state();
+		if (instance_state.is_valid()) {
+			return instance_state->get_root_type();
 		}
 	}
 
-	return true;
+	return StringName();
 }
 
 void SceneTreeDock::_node_reparent(NodePath p_path, bool p_keep_global_xform) {
@@ -3347,11 +3370,28 @@ void SceneTreeDock::_replace_node(Node *p_node, Node *p_by_node, bool p_keep_pro
 		size = old_control->get_size();
 	}
 
+	// Carry the link to the scene this node comes from across the swap, so that retyping the root
+	// of an inherited or instantiated scene keeps it inherited/instantiated. Node::replace_by()
+	// only transfers the scene file path.
+	Ref<SceneState> inherited_state = oldnode->get_scene_inherited_state();
+	Ref<SceneState> instance_state = oldnode->get_scene_instance_state();
+	bool load_placeholder = oldnode->get_scene_instance_load_placeholder();
+
 	String newname = oldnode->get_name();
 	if (oldnode == edited_scene) {
 		EditorNode::get_singleton()->set_edited_scene_root(newnode, false);
 	}
 	oldnode->replace_by(newnode, true);
+
+	if (inherited_state.is_valid()) {
+		newnode->set_scene_inherited_state(inherited_state);
+	}
+	if (instance_state.is_valid()) {
+		newnode->set_scene_instance_state(instance_state);
+	}
+	if (load_placeholder) {
+		newnode->set_scene_instance_load_placeholder(true);
+	}
 
 	// Re-apply size of anchored control.
 	Control *new_control = Object::cast_to<Control>(newnode);
@@ -3941,7 +3981,11 @@ void SceneTreeDock::_tree_rmb(const Vector2 &p_menu_pos) {
 	if (profile_allow_editing) {
 		for (Node *E : full_selection) {
 			if (E != edited_scene && (E->get_owner() != edited_scene || E->is_instance())) {
-				can_replace = false;
+				// The root of a sub-scene instantiated by the edited scene is exempt: it can be
+				// retyped to a subclass of the sub-scene's root type.
+				if (E->get_owner() != edited_scene || !E->is_instance() || E->get_scene_instance_load_placeholder()) {
+					can_replace = false;
+				}
 				if (!E->is_instance()) {
 					can_rename = false;
 				}
@@ -3949,7 +3993,11 @@ void SceneTreeDock::_tree_rmb(const Vector2 &p_menu_pos) {
 
 			if (edited_scene->get_scene_inherited_state().is_valid()) {
 				if (E == edited_scene || edited_scene->get_scene_inherited_state()->find_node_by_path(edited_scene->get_path_to(E)) >= 0) {
-					can_replace = false;
+					// The root of an inherited scene is exempt: it can be retyped to a subclass of
+					// the base scene's root type. Nodes deeper in the base scene cannot.
+					if (E != edited_scene) {
+						can_replace = false;
+					}
 					can_rename = false;
 				}
 			}

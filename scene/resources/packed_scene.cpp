@@ -225,7 +225,50 @@ static Node *_find_node_by_id(Node *p_owner, Node *p_node, int32_t p_id) {
 	return nullptr;
 }
 
-Node *SceneState::instantiate(GenEditState p_edit_state) const {
+// Resolves a root type override against the class the root would otherwise be created with.
+// Returns an empty StringName (meaning "use the original type") whenever the override is unusable,
+// so that a stale or removed subclass degrades to the base type instead of failing the whole load.
+static StringName _resolve_root_type_override(const StringName &p_override, const StringName &p_base_type, const String &p_scene_path) {
+	if (p_override == StringName() || p_override == p_base_type) {
+		return StringName();
+	}
+
+	const String scene_prefix = p_scene_path.is_empty() ? String() : p_scene_path + ": ";
+
+	if (!ClassDB::class_exists(p_override)) {
+		WARN_PRINT(vformat("%sRoot node type was overridden to \"%s\", but that class does not exist. Falling back to \"%s\".", scene_prefix, p_override, p_base_type));
+		return StringName();
+	}
+	if (!ClassDB::is_parent_class(p_override, p_base_type)) {
+		WARN_PRINT(vformat("%sRoot node type was overridden to \"%s\", which no longer inherits \"%s\". Falling back to \"%s\".", scene_prefix, p_override, p_base_type, p_base_type));
+		return StringName();
+	}
+	if (!ClassDB::can_instantiate(p_override)) {
+		WARN_PRINT(vformat("%sRoot node type was overridden to \"%s\", which cannot be instantiated. Falling back to \"%s\".", scene_prefix, p_override, p_base_type));
+		return StringName();
+	}
+
+	return p_override;
+}
+
+StringName SceneState::get_root_type() const {
+	const SceneState *ss = this;
+	Ref<SceneState> base_keepalive;
+
+	while (ss && !ss->nodes.is_empty()) {
+		const NodeData &root = ss->nodes[0];
+		if (root.type != TYPE_INSTANTIATED) {
+			ERR_FAIL_INDEX_V(root.type, ss->names.size(), StringName());
+			return ss->names[root.type];
+		}
+		base_keepalive = ss->get_base_scene_state();
+		ss = base_keepalive.ptr();
+	}
+
+	return StringName();
+}
+
+Node *SceneState::instantiate(GenEditState p_edit_state, const StringName &p_root_type_override) const {
 	// Nodes where instantiation failed (because something is missing.)
 	List<Node *> stray_instances;
 
@@ -299,11 +342,23 @@ Node *SceneState::instantiate(GenEditState p_edit_state) const {
 		MissingNode *missing_node = nullptr;
 		bool is_inherited_scene = false;
 
+		// A node that carries a real type while it is inherited or instantiated is a subclass
+		// override for the root of the scene it pulls in. An override handed down by an outer
+		// scene wins, since it was validated against this scene's own root type and is
+		// therefore at least as derived.
+		StringName root_type_override;
+		if (n.type != TYPE_INSTANTIATED && n.type >= 0 && n.type < sname_count) {
+			root_type_override = snames[n.type];
+		}
+		if (i == 0 && p_root_type_override != StringName()) {
+			root_type_override = p_root_type_override;
+		}
+
 		if (i == 0 && base_scene_idx >= 0) {
 			// Scene inheritance on root node.
 			Ref<PackedScene> sdata = props[base_scene_idx];
 			ERR_FAIL_COND_V(sdata.is_null(), nullptr);
-			node = sdata->instantiate(p_edit_state == GEN_EDIT_STATE_DISABLED ? PackedScene::GEN_EDIT_STATE_DISABLED : PackedScene::GEN_EDIT_STATE_INSTANCE); //only main gets main edit state
+			node = sdata->instantiate_with_root_type(p_edit_state == GEN_EDIT_STATE_DISABLED ? PackedScene::GEN_EDIT_STATE_DISABLED : PackedScene::GEN_EDIT_STATE_INSTANCE, root_type_override); //only main gets main edit state
 			ERR_FAIL_NULL_V(node, nullptr);
 			if (p_edit_state != GEN_EDIT_STATE_DISABLED) {
 				node->set_scene_inherited_state(sdata->get_state());
@@ -336,7 +391,7 @@ Node *SceneState::instantiate(GenEditState p_edit_state) const {
 				Ref<Resource> res = props[n.instance & FLAG_MASK];
 				Ref<PackedScene> sdata = res;
 				if (sdata.is_valid()) {
-					node = sdata->instantiate(p_edit_state == GEN_EDIT_STATE_DISABLED ? PackedScene::GEN_EDIT_STATE_DISABLED : PackedScene::GEN_EDIT_STATE_INSTANCE);
+					node = sdata->instantiate_with_root_type(p_edit_state == GEN_EDIT_STATE_DISABLED ? PackedScene::GEN_EDIT_STATE_DISABLED : PackedScene::GEN_EDIT_STATE_INSTANCE, root_type_override);
 					ERR_FAIL_NULL_V_MSG(node, nullptr, vformat("Failed to load scene dependency: \"%s\". Make sure the required scene is valid.", sdata->get_path()));
 				} else if (ResourceLoader::is_creating_missing_resources_if_class_unavailable_enabled()) {
 					missing_node = memnew(MissingNode);
@@ -388,7 +443,17 @@ Node *SceneState::instantiate(GenEditState p_edit_state) const {
 			}
 		} else {
 			// Node belongs to this scene and must be created.
-			Object *obj = ClassDB::instantiate(snames[n.type]);
+			StringName type_to_create = snames[n.type];
+			if (i == 0 && p_root_type_override != StringName()) {
+				// An outer scene inherits from or instantiates this one and retyped its root
+				// to a subclass. Falls back to the declared type if the override is unusable.
+				const StringName resolved = _resolve_root_type_override(p_root_type_override, type_to_create, get_path());
+				if (resolved != StringName()) {
+					type_to_create = resolved;
+				}
+			}
+
+			Object *obj = ClassDB::instantiate(type_to_create);
 
 			node = Object::cast_to<Node>(obj);
 
@@ -400,12 +465,12 @@ Node *SceneState::instantiate(GenEditState p_edit_state) const {
 
 				if (ResourceLoader::is_creating_missing_resources_if_class_unavailable_enabled()) {
 					missing_node = memnew(MissingNode);
-					missing_node->set_original_class(snames[n.type]);
+					missing_node->set_original_class(type_to_create);
 					missing_node->set_recording_properties(true);
 					node = missing_node;
 					obj = missing_node;
 				} else {
-					WARN_PRINT(vformat("Node %s of type %s cannot be created. A placeholder will be created instead.", snames[n.name], snames[n.type]).ascii().get_data());
+					WARN_PRINT(vformat("Node %s of type %s cannot be created. A placeholder will be created instead.", snames[n.name], type_to_create).ascii().get_data());
 					if (n.parent >= 0 && n.parent < nc && ret_nodes[n.parent]) {
 						if (Object::cast_to<Control>(ret_nodes[n.parent])) {
 							obj = memnew(Control);
@@ -781,7 +846,10 @@ Variant SceneState::make_local_resource(Variant &p_value, const SceneState::Node
 
 	Node *base = (p_i == 0 || p_node->is_instance()) ? p_node : (p_node->get_owner() ? p_node->get_owner() : p_ret_nodes[0]);
 
-	if (p_node_data.type == TYPE_INSTANTIATED) { // For the (root) nodes of sub-scenes, treat them as parts of the sub-scenes.
+	// For the (root) nodes of sub-scenes, treat them as parts of the sub-scenes. Such a node may
+	// also carry a real type when its root was retyped to a subclass, so the sentinel alone is not
+	// a sufficient test.
+	if (p_node_data.type == TYPE_INSTANTIATED || p_node_data.instance >= 0 || (p_i == 0 && base_scene_idx >= 0)) {
 		return get_remap_resource(res, p_resources_local_to_scenes, p_node->get(p_sname), base);
 	}
 
@@ -911,6 +979,9 @@ Error SceneState::_parse_node(Node *p_owner, Node *p_node, int p_parent_idx, Has
 	bool instantiated_by_owner = false;
 	Vector<SceneState::PackState> states_stack = PropertyUtils::get_node_states_stack(p_node, p_owner, &instantiated_by_owner);
 
+	// Class this node's sub-scene creates its root with, so a retype to a subclass can be detected below.
+	StringName sub_scene_root_type;
+
 	if (p_node->is_instance() && p_node->get_owner() == p_owner && instantiated_by_owner) {
 		if (p_node->get_scene_instance_load_placeholder()) {
 			//it's a placeholder, use the placeholder path
@@ -924,6 +995,7 @@ Error SceneState::_parse_node(Node *p_owner, Node *p_node, int p_parent_idx, Has
 			}
 
 			nd.instance = _vm_get_variant(instance, variant_map);
+			sub_scene_root_type = instance->get_root_type();
 		}
 	}
 
@@ -1131,9 +1203,25 @@ Error SceneState::_parse_node(Node *p_owner, Node *p_node, int p_parent_idx, Has
 			nd.type = _nm_get_string(p_node->get_class(), name_map);
 		}
 	} else {
-		// this node is part of an instantiated process, so do not save the type.
-		// instead, save that it was instantiated
-		nd.type = TYPE_INSTANTIATED;
+		// This node is part of an instantiation process, so normally the type is not saved and the
+		// node is reused as-is. The exception is the root of an inherited or instantiated scene,
+		// which may have been retyped to a subclass; that has to be recorded so the right class can
+		// be constructed on load.
+		StringName scene_root_type;
+		if (p_node == p_owner && p_owner->get_scene_inherited_state().is_valid()) {
+			scene_root_type = p_owner->get_scene_inherited_state()->get_root_type();
+		} else {
+			scene_root_type = sub_scene_root_type;
+		}
+
+		const StringName node_type = missing_node != nullptr ? StringName(missing_node->get_original_class()) : StringName(p_node->get_class());
+
+		if (scene_root_type != StringName() && node_type != scene_root_type && ClassDB::is_parent_class(node_type, scene_root_type)) {
+			nd.type = _nm_get_string(node_type, name_map);
+		} else {
+			// Not a subclass override, so just save that it was instantiated.
+			nd.type = TYPE_INSTANTIATED;
+		}
 	}
 
 	// determine whether to save this node or not
@@ -2577,12 +2665,20 @@ bool PackedScene::can_instantiate() const {
 	return state->can_instantiate();
 }
 
+StringName PackedScene::get_root_type() const {
+	return state->get_root_type();
+}
+
 Node *PackedScene::instantiate(GenEditState p_edit_state) const {
+	return instantiate_with_root_type(p_edit_state, StringName());
+}
+
+Node *PackedScene::instantiate_with_root_type(GenEditState p_edit_state, const StringName &p_root_type_override) const {
 #ifndef TOOLS_ENABLED
 	ERR_FAIL_COND_V_MSG(p_edit_state != GEN_EDIT_STATE_DISABLED, nullptr, "Edit state is only for editors, does not work without tools compiled.");
 #endif
 
-	Node *s = state->instantiate((SceneState::GenEditState)p_edit_state);
+	Node *s = state->instantiate((SceneState::GenEditState)p_edit_state, p_root_type_override);
 	if (!s) {
 		return nullptr;
 	}
